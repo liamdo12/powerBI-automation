@@ -12,11 +12,47 @@ from pages.base_page import BasePage
 VISUAL_CONTAINER_SELECTOR = "visual-container, [class*='visualContainerHost']"
 
 _CONTAINER_ANCESTOR_XPATH = (
-    "xpath=ancestor-or-self::visual-container"
-    " | ancestor-or-self::*[contains(@class,'visualContainerHost')]"
+    "xpath=(ancestor-or-self::visual-container"
+    " | ancestor-or-self::*[contains(@class,'visualContainerHost')])[last()]"
 )
 
 _STRATEGY_PROBE_MS = 2500
+
+_FIND_CHART_SCROLLBAR_JS = r"""el => {
+    let root = el;
+    const host = el.querySelector('[aria-label]');
+    if (host) {
+        const r = host.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) root = host;
+    }
+    const rootRect = root.getBoundingClientRect();
+    const rects = [];
+    for (const n of el.querySelectorAll('svg rect')) {
+        const r = n.getBoundingClientRect();
+        if (r.width < 30 || r.height < 3 || r.height > 15) continue;
+        if (r.x < rootRect.x - 1 || r.x + r.width > rootRect.x + rootRect.width + 1) continue;
+        if (r.y < rootRect.y + rootRect.height * 0.80) continue;
+        if (r.y > rootRect.y + rootRect.height) continue;
+        rects.push(r);
+    }
+    if (rects.length < 2) return null;
+    const byY = {};
+    for (const r of rects) {
+        const k = Math.round(r.y);
+        (byY[k] ||= []).push(r);
+    }
+    for (const k in byY) {
+        if (byY[k].length < 2) continue;
+        const sorted = byY[k].slice().sort((a, b) => a.width - b.width);
+        const thumb = sorted[0];
+        const track = sorted[sorted.length - 1];
+        return {
+            thumb: { x: thumb.x, y: thumb.y, w: thumb.width, h: thumb.height },
+            track: { x: track.x, y: track.y, w: track.width, h: track.height },
+        };
+    }
+    return null;
+}"""
 
 
 class ReportPage(BasePage):
@@ -36,50 +72,118 @@ class ReportPage(BasePage):
         self._frame().wait_for_selector(VISUAL_CONTAINER_SELECTOR, timeout=timeout)
         return self
 
+    def _visual_scope(self, anchor: Locator) -> Locator:
+        scope = anchor.locator(_CONTAINER_ANCESTOR_XPATH).first
+        return scope if scope.count() > 0 else anchor
 
-    def scroll_report_by(self, dy: int = 400, dx: int = 0) -> "ReportPage":
-        frame = self._frame()
-        frame.evaluate(
-            r"""([dx, dy]) => {
-                const pick = () => {
-                    const fixed = document.querySelector('.mid-viewport');
-                    if (fixed && fixed.scrollHeight > fixed.clientHeight) return fixed;
-                    let best = null, bestArea = 0;
-                    for (const n of document.querySelectorAll('*')) {
-                        const cs = getComputedStyle(n);
-                        const oy = cs.overflowY, ox = cs.overflowX;
-                        const scY = (oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 2;
-                        const scX = (ox === 'auto' || ox === 'scroll') && n.scrollWidth > n.clientWidth + 2;
-                        if (!scY && !scX) continue;
-                        const area = n.clientWidth * n.clientHeight;
-                        if (area > bestArea) { best = n; bestArea = area; }
+    def visual_bbox(self, container: Locator) -> dict:
+        scope = self._visual_scope(container)
+        bbox = scope.evaluate(
+            r"""el => {
+                const pref = el.querySelector('.visualContainer');
+                if (pref) {
+                    const r = pref.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                        return { x: r.x, y: r.y, width: r.width, height: r.height };
                     }
-                    return best;
-                };
-                const el = pick();
-                if (!el) throw new Error('No scrollable report viewport found');
-                el.scrollBy({ left: dx, top: dy, behavior: 'instant' });
-            }""",
-            [dx, dy],
+                }
+                let best = null;
+                for (const n of el.querySelectorAll('[aria-label]')) {
+                    const r = n.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) continue;
+                    const area = r.width * r.height;
+                    if (!best || area > best.area) best = { area, r };
+                }
+                if (best) {
+                    const r = best.r;
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                return null;
+            }"""
         )
-        return self
+        if not bbox:
+            raise RuntimeError("Could not resolve a non-zero bbox for container")
+        return bbox
 
-    def scroll_container_into_view(self, container: Locator) -> "ReportPage":
-        container.scroll_into_view_if_needed()
-        return self
+    def get_chart_scrollbar(self, container: Locator) -> dict:
+        scope = self._visual_scope(container)
+        geom = scope.evaluate(_FIND_CHART_SCROLLBAR_JS)
+        if not geom:
+            raise RuntimeError("No SVG horizontal scrollbar found inside container")
 
+        thumb, track = geom["thumb"], geom["track"]
+        remaining_left = thumb["x"] - track["x"]
+        remaining_right = (track["x"] + track["w"]) - (thumb["x"] + thumb["w"])
+        travel = max(track["w"] - thumb["w"], 1e-9)
+        progress = remaining_left / travel
+        return {
+            "thumb": thumb,
+            "track": track,
+            "remaining_left": remaining_left,
+            "remaining_right": remaining_right,
+            "progress": progress,
+        }
+
+    def scroll_chart_horizontally(self, container: Locator, dx: int) -> dict:
+        scope = self._visual_scope(container)
+        geom = scope.evaluate(_FIND_CHART_SCROLLBAR_JS)
+        if not geom:
+            raise RuntimeError("No SVG horizontal scrollbar found inside container")
+
+        thumb, track = geom["thumb"], geom["track"]
+        cx = thumb["x"] + thumb["w"] / 2
+        cy = thumb["y"] + thumb["h"] / 2
+        min_cx = track["x"] + thumb["w"] / 2
+        max_cx = track["x"] + track["w"] - thumb["w"] / 2
+        target_cx = max(min_cx, min(max_cx, cx + dx))
+
+        self.page.mouse.move(cx, cy)
+        self.page.mouse.down()
+        steps = max(5, int(abs(target_cx - cx) / 20))
+        for i in range(1, steps + 1):
+            self.page.mouse.move(cx + (target_cx - cx) * i / steps, cy, steps=1)
+            self.page.wait_for_timeout(20)
+        self.page.mouse.up()
+        self.page.wait_for_timeout(300)
+
+        return {"thumb": thumb, "track": track, "moved": int(target_cx - cx)}
+
+    def scroll_table_vertically(self, container: Locator, dy: int) -> dict:
+        scope = self._visual_scope(container)
+        result = scope.evaluate(
+            r"""(el, dy) => {
+                let scrolledY = 0, candidates = 0;
+                for (const n of el.querySelectorAll('*')) {
+                    const cs = getComputedStyle(n);
+                    const scY = (cs.overflowY === 'auto' || cs.overflowY === 'scroll')
+                                && n.scrollHeight > n.clientHeight + 2;
+                    if (!scY) continue;
+                    candidates++;
+                    const before = n.scrollTop;
+                    n.scrollBy({ top: dy, behavior: 'instant' });
+                    scrolledY += n.scrollTop - before;
+                }
+                return { scrolledY, candidates };
+            }""",
+            dy,
+        )
+        if result["candidates"] == 0:
+            raise RuntimeError("No vertical scroll viewport found inside container")
+        return result
 
     def container_by_title(self, title: str, timeout: int = 30000) -> Locator:
-
         frame = self._frame()
-        pattern = re.compile(re.escape(title), re.IGNORECASE)
-        css_title = _css_escape(title)
+        pattern = _exact_pattern(title)
 
         strategies: List[Callable[[], Locator]] = [
             lambda: frame.get_by_role("heading", name=pattern).first,
-            lambda: frame.locator(f"[aria-label*={css_title} i]").first,
-            lambda: frame.locator(f"[title*={css_title} i]").first,
-            lambda: frame.get_by_text(pattern, exact=False).first,
+            lambda: frame.get_by_label(pattern).first,
+            lambda: frame.get_by_title(pattern).first,
+            lambda: frame.get_by_text(pattern).first,
         ]
 
         return self._first_visible_container(strategies, timeout=timeout, label=title)
@@ -101,32 +205,6 @@ class ReportPage(BasePage):
         ]
 
         return self._first_visible_container(strategies, timeout=timeout, label=header)
-
-    def list_visible_titles(self) -> List[str]:
-
-        frame = self._frame()
-        titles: List[str] = []
-        for loc in frame.get_by_role("heading").all():
-            try:
-                if loc.is_visible():
-                    titles.append(loc.inner_text().strip())
-            except Exception:
-                continue
-        for loc in frame.locator("[aria-label]").all()[:200]:
-            try:
-                if loc.is_visible():
-                    label = loc.get_attribute("aria-label") or ""
-                    if label.strip():
-                        titles.append(label.strip())
-            except Exception:
-                continue
-        seen = set()
-        out = []
-        for t in titles:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out
 
     def _first_visible_container(
         self,
@@ -153,9 +231,6 @@ class ReportPage(BasePage):
                     last_error = err
                     continue
 
-                ancestor = loc.locator(_CONTAINER_ANCESTOR_XPATH).first
-                if ancestor.count() > 0:
-                    return ancestor
                 return loc
 
         raise last_error or PWTimeout(
@@ -166,3 +241,7 @@ class ReportPage(BasePage):
 def _css_escape(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _exact_pattern(text: str) -> "re.Pattern[str]":
+    return re.compile(rf"^\s*{re.escape(text)}\s*$", re.IGNORECASE)
