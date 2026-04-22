@@ -1,0 +1,1 @@
+BASE_URL = "https://app.fabric.microsoft.com/view?r=eyJrIjoiMTdkNGI1ZGYtNmFmOS00MGM0LTk3MGEtZGE3N2IwMGQxZTk5IiwidCI6ImNiMjlmODRlLTA3NjYtNDc5ZC1hZTYzLTdlNmVlYjUzYmY3NCJ9"
