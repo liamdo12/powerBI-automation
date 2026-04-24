@@ -51,6 +51,62 @@ A simple automation tool that using the Playwright API with Behave and JavaScrip
 - Behave 1.3.3
 - Pillow >=10
 
+## Setup
+
+Requires Python 3.13+. From the project root:
+
+```bash
+
+python3 -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+
+
+pip install -r requirements.txt
+
+playwright install chromium
+```
+
+## How to run
+
+Default run (headless Chromium against the URL in `constants/urls.py`):
+
+```bash
+behave
+```
+
+Common overrides via Behave's `-D key=value` userdata (these keys are read in `features/environment.py` and `behave.ini`):
+
+| Key              | Default   | Purpose                                     |
+|------------------|-----------|---------------------------------------------|
+| `headless`       | `true`    | set `false` to watch the browser            |
+| `browser`        | `chromium`| `chromium` / `firefox` / `webkit`           |
+| `base_url`       | Power BI  | point at a different report                 |
+| `viewport_width` | `1280`    | viewport size                               |
+| `viewport_height`| `720`     |                                             |
+| `visual_timeout` | `30000`   | ms to wait for a visual to render           |
+
+Examples:
+
+```bash
+
+behave -D headless=false
+
+
+behave -D visual_timeout=45000
+
+
+behave -n "Weekly trend chart loads"
+
+
+behave features/check_containers.feature
+```
+
+### Outputs
+
+- `reports/output/`       — stitched scroll-capture panoramas (PNG)
+- `reports/junit/`        — JUnit XML, one file per scenario
+- `reports/screenshots/`  — screenshot for any step that failed or errored
+
 ## Issues?
 1. The Power BI report page can't capture correctly
 => The issue was the whole page was embedded as an iframe, it can't be used like normal approach to capture the elements
@@ -68,6 +124,10 @@ I came up with a solution to use multiple strategies to get the label, so it can
 
 5. Playwright API and Behave for Gherkins definition
 => I need to get familiar with the Playwright API by checking their documentation, try their functions, test with the PowerBI to see if they work. I also need to explore the Behave documentation for the integration.
+
+## Improvements
+1. The current automation tool only works with the exact PowerBI site that defined in the config since it detects the scrollable containers by label
+=> Improve to automatically detect the scrollable containers without label and can work with different PowerBI sites
 
 
 
