@@ -2,57 +2,23 @@ from __future__ import annotations
 
 import re
 import time
+from pathlib import Path
 from typing import Callable, List, Optional
 
 from playwright.sync_api import Frame, Locator, TimeoutError as PWTimeout
 
-from pages.base_page import BasePage
-
-
-VISUAL_CONTAINER_SELECTOR = "visual-container, [class*='visualContainerHost']"
-
-_CONTAINER_ANCESTOR_XPATH = (
-    "xpath=(ancestor-or-self::visual-container"
-    " | ancestor-or-self::*[contains(@class,'visualContainerHost')])[last()]"
+from constants.power_bi import (
+    CONTAINER_ANCESTOR_XPATH,
+    DEFAULT_OUTPUT_DIR,
+    FIND_CHART_SCROLLBAR_JS,
+    FIND_TABLE_SCROLL_JS,
+    FIND_VISUAL_BBOX_JS,
+    MAX_SCROLL_STEPS,
+    STRATEGY_PROBE_MS,
+    VISUAL_CONTAINER_SELECTOR,
 )
-
-_STRATEGY_PROBE_MS = 2500
-
-_FIND_CHART_SCROLLBAR_JS = r"""el => {
-    let root = el;
-    const host = el.querySelector('[aria-label]');
-    if (host) {
-        const r = host.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) root = host;
-    }
-    const rootRect = root.getBoundingClientRect();
-    const rects = [];
-    for (const n of el.querySelectorAll('svg rect')) {
-        const r = n.getBoundingClientRect();
-        if (r.width < 30 || r.height < 3 || r.height > 15) continue;
-        if (r.x < rootRect.x - 1 || r.x + r.width > rootRect.x + rootRect.width + 1) continue;
-        if (r.y < rootRect.y + rootRect.height * 0.80) continue;
-        if (r.y > rootRect.y + rootRect.height) continue;
-        rects.push(r);
-    }
-    if (rects.length < 2) return null;
-    const byY = {};
-    for (const r of rects) {
-        const k = Math.round(r.y);
-        (byY[k] ||= []).push(r);
-    }
-    for (const k in byY) {
-        if (byY[k].length < 2) continue;
-        const sorted = byY[k].slice().sort((a, b) => a.width - b.width);
-        const thumb = sorted[0];
-        const track = sorted[sorted.length - 1];
-        return {
-            thumb: { x: thumb.x, y: thumb.y, w: thumb.width, h: thumb.height },
-            track: { x: track.x, y: track.y, w: track.width, h: track.height },
-        };
-    }
-    return null;
-}"""
+from pages.base_page import BasePage
+from utils.image_stitch import stitch_to_file
 
 
 class ReportPage(BasePage):
@@ -73,45 +39,19 @@ class ReportPage(BasePage):
         return self
 
     def _visual_scope(self, anchor: Locator) -> Locator:
-        scope = anchor.locator(_CONTAINER_ANCESTOR_XPATH).first
+        scope = anchor.locator(CONTAINER_ANCESTOR_XPATH).first
         return scope if scope.count() > 0 else anchor
 
     def visual_bbox(self, container: Locator) -> dict:
         scope = self._visual_scope(container)
-        bbox = scope.evaluate(
-            r"""el => {
-                const pref = el.querySelector('.visualContainer');
-                if (pref) {
-                    const r = pref.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0) {
-                        return { x: r.x, y: r.y, width: r.width, height: r.height };
-                    }
-                }
-                let best = null;
-                for (const n of el.querySelectorAll('[aria-label]')) {
-                    const r = n.getBoundingClientRect();
-                    if (r.width <= 0 || r.height <= 0) continue;
-                    const area = r.width * r.height;
-                    if (!best || area > best.area) best = { area, r };
-                }
-                if (best) {
-                    const r = best.r;
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
-                }
-                const r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) {
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
-                }
-                return null;
-            }"""
-        )
+        bbox = scope.evaluate(FIND_VISUAL_BBOX_JS)
         if not bbox:
             raise RuntimeError("Could not resolve a non-zero bbox for container")
         return bbox
 
     def get_chart_scrollbar(self, container: Locator) -> dict:
         scope = self._visual_scope(container)
-        geom = scope.evaluate(_FIND_CHART_SCROLLBAR_JS)
+        geom = scope.evaluate(FIND_CHART_SCROLLBAR_JS)
         if not geom:
             raise RuntimeError("No SVG horizontal scrollbar found inside container")
 
@@ -128,52 +68,84 @@ class ReportPage(BasePage):
             "progress": progress,
         }
 
-    def scroll_chart_horizontally(self, container: Locator, dx: int) -> dict:
+    def get_table_scroll(self, container: Locator) -> dict:
         scope = self._visual_scope(container)
-        geom = scope.evaluate(_FIND_CHART_SCROLLBAR_JS)
-        if not geom:
-            raise RuntimeError("No SVG horizontal scrollbar found inside container")
-
-        thumb, track = geom["thumb"], geom["track"]
-        cx = thumb["x"] + thumb["w"] / 2
-        cy = thumb["y"] + thumb["h"] / 2
-        min_cx = track["x"] + thumb["w"] / 2
-        max_cx = track["x"] + track["w"] - thumb["w"] / 2
-        target_cx = max(min_cx, min(max_cx, cx + dx))
-
-        self.page.mouse.move(cx, cy)
-        self.page.mouse.down()
-        steps = max(5, int(abs(target_cx - cx) / 20))
-        for i in range(1, steps + 1):
-            self.page.mouse.move(cx + (target_cx - cx) * i / steps, cy, steps=1)
-            self.page.wait_for_timeout(20)
-        self.page.mouse.up()
-        self.page.wait_for_timeout(300)
-
-        return {"thumb": thumb, "track": track, "moved": int(target_cx - cx)}
-
-    def scroll_table_vertically(self, container: Locator, dy: int) -> dict:
-        scope = self._visual_scope(container)
-        result = scope.evaluate(
-            r"""(el, dy) => {
-                let scrolledY = 0, candidates = 0;
-                for (const n of el.querySelectorAll('*')) {
-                    const cs = getComputedStyle(n);
-                    const scY = (cs.overflowY === 'auto' || cs.overflowY === 'scroll')
-                                && n.scrollHeight > n.clientHeight + 2;
-                    if (!scY) continue;
-                    candidates++;
-                    const before = n.scrollTop;
-                    n.scrollBy({ top: dy, behavior: 'instant' });
-                    scrolledY += n.scrollTop - before;
-                }
-                return { scrolledY, candidates };
-            }""",
-            dy,
-        )
-        if result["candidates"] == 0:
+        result = scope.evaluate(FIND_TABLE_SCROLL_JS)
+        if not result:
             raise RuntimeError("No vertical scroll viewport found inside container")
+        result["remaining_bottom"] = max(
+            result["scrollHeight"] - result["clientHeight"] - result["scrollTop"], 0
+        )
         return result
+
+    def scroll_chart_horizontally(self, container: Locator, dx: int) -> None:
+        self._wheel_over(container, dx=dx, dy=0)
+
+    def scroll_table_vertically(self, container: Locator, dy: int) -> None:
+        self._wheel_over(container, dx=0, dy=dy)
+
+    def _wheel_over(self, container: Locator, dx: int, dy: int) -> None:
+        box = self.visual_bbox(container)
+        cx = box["x"] + box["width"] / 2
+        cy = box["y"] + box["height"] / 2
+        self.page.mouse.move(cx, cy)
+        self.page.mouse.wheel(dx, dy)
+        self.page.wait_for_timeout(200)
+
+    def scroll_chart_horizontally_and_capture(
+        self,
+        title: str,
+        timeout: int = 30000,
+        output_dir: Optional[Path] = None,
+    ) -> Path:
+        self.wait_for_visuals_ready(timeout=timeout)
+        container = self.container_by_title(title, timeout=timeout)
+        self.scroll_chart_horizontally(container, dx=-10_000)
+
+        frames: List[bytes] = []
+        for _ in range(MAX_SCROLL_STEPS):
+            frames.append(self.page.screenshot(clip=self.visual_bbox(container)))
+            if self.get_chart_scrollbar(container)["remaining_right"] <= 1:
+                break
+            for _ in range(3):
+                self.scroll_chart_horizontally(container, dx=1200)
+
+        out = (output_dir or DEFAULT_OUTPUT_DIR) / f"{_slug(title)}_horizontal.png"
+        stitch_to_file(frames, out, orientation="horizontal")
+        return out
+
+    def scroll_table_vertically_and_capture(
+        self,
+        column_header: str,
+        timeout: int = 30000,
+        output_dir: Optional[Path] = None,
+    ) -> Path:
+        self.wait_for_visuals_ready(timeout=timeout)
+        container = self.container_by_column_header(column_header, timeout=timeout)
+
+        self.scroll_table_vertically(container, dy=-10_000_000)
+
+        bbox = self.visual_bbox(container)
+        page_step = max(int(bbox["height"] * 0.9), 50)
+
+        frames: List[bytes] = [self.page.screenshot(clip=self.visual_bbox(container))]
+        for _ in range(MAX_SCROLL_STEPS):
+            before = self.get_table_scroll(container)["scrollTop"]
+            self.scroll_table_vertically(container, dy=page_step)
+            after = self.get_table_scroll(container)
+            if after["scrollTop"] == before:
+                break  # hit bottom
+            frames.append(self.page.screenshot(clip=self.visual_bbox(container)))
+            if after["remaining_bottom"] == 0:
+                break
+
+        out = (output_dir or DEFAULT_OUTPUT_DIR) / f"{_slug(column_header)}_vertical.png"
+        stitch_to_file(frames, out, orientation="vertical")
+        return out
+
+    @staticmethod
+    def visual_timeout_from(context) -> int:
+        return int(context.config.userdata.get("visual_timeout", "30000") or 30000)
 
     def container_by_title(self, title: str, timeout: int = 30000) -> Locator:
         frame = self._frame()
@@ -212,7 +184,7 @@ class ReportPage(BasePage):
         timeout: int,
         label: str,
     ) -> Locator:
-        deadline = time.monotonic() + max(timeout, _STRATEGY_PROBE_MS) / 1000.0
+        deadline = time.monotonic() + max(timeout, STRATEGY_PROBE_MS) / 1000.0
         last_error: Optional[BaseException] = None
 
         while time.monotonic() < deadline:
@@ -220,7 +192,7 @@ class ReportPage(BasePage):
                 remaining_ms = int((deadline - time.monotonic()) * 1000)
                 if remaining_ms <= 0:
                     break
-                slice_ms = min(_STRATEGY_PROBE_MS, remaining_ms)
+                slice_ms = min(STRATEGY_PROBE_MS, remaining_ms)
                 try:
                     loc = build()
                     loc.wait_for(state="visible", timeout=slice_ms)
@@ -241,6 +213,11 @@ class ReportPage(BasePage):
 def _css_escape(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _slug(text: str) -> str:
+    """Kebab-ish file-name slug: lowercase alphanumerics, underscores as separators."""
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
 def _exact_pattern(text: str) -> "re.Pattern[str]":
