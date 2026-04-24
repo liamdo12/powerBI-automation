@@ -107,23 +107,22 @@ behave features/check_containers.feature
 - `reports/junit/`        — JUnit XML, one file per scenario
 - `reports/screenshots/`  — screenshot for any step that failed or errored
 
-## Issues?
-1. The Power BI report page can't capture correctly
-=> The issue was the whole page was embedded as an iframe, it can't be used like normal approach to capture the elements
+## Issues & resolutions
 
-2. How to find the XPATH of the element?
-=> I have to setup debugging mode by using the `context.page.pause()` with the `--no-capture` flag from the Behave then use the debug tool to find correct path. 
-For some of the complicated XPATH like the relative path `ancestor-or-self::visual-container`, I have to enable the developer tool in browser, look up and try for each of the components, their parents and capture the classes.
+### 1. The Power BI report page couldn't be captured correctly
+The page is embedded inside an `iframe`, so ordinary top-level element lookups return nothing. Resolved by resolving the hosting frame first (`_frame()` in `ReportPage`) and running all queries against that frame.
 
-3. Why there are JS code?
-=> Pure Playwright API can't be worked correctly when scrolling. So I have to use an alternative approach by capturing the scroll bar (`svg` element) then use it to scroll left, right, up, down
+### 2. How to find the XPath of an element?
+Enabled Behave's debug mode with `context.page.pause()` + the `--no-capture` flag, then used the browser devtools to inspect the actual DOM. For relative paths like `ancestor-or-self::visual-container`, I walked the parent chain in devtools and picked the innermost stable class.
 
-4. Why there are multiple level of capturing the label?
-=> I tried to use a single `get_by_label` for all the labels but it doesn't work correctly, it failed to capture the label several times. Some of the label was a column header so it needs to handle differently.
-I came up with a solution to use multiple strategies to get the label, so it can guarantee that the script will always find the correct data (first correct strategy returns)
+### 3. Why is there JS in the page object?
+The pure Playwright API couldn't drive Power BI's custom SVG scrollbars and cross-element DOM queries in one round-trip. The remaining JS (in `constants/power_bi.py`) is read-only inspection — locating the visual's bbox, finding the SVG track/thumb rects, reading native `scrollTop`. The actual scroll itself is pure Playwright (`page.mouse.wheel`).
 
-5. Playwright API and Behave for Gherkins definition
-=> I need to get familiar with the Playwright API by checking their documentation, try their functions, test with the PowerBI to see if they work. I also need to explore the Behave documentation for the integration.
+### 4. Why multiple strategies for finding a label?
+A single `get_by_label` failed intermittently — Power BI renders titles as split headings, aria-labelled wrappers, `title` attributes, or SVG text depending on the visual type. Column headers live in a different subtree altogether. `container_by_title` runs strategies in priority order (heading → aria-label → title attr → visible text); the first visible hit wins.
+
+### 5. Getting familiar with Playwright + Behave
+Combined the Playwright Python docs with small Power BI experiments to map its APIs onto the report's DOM, and the Behave docs to wire steps + `environment.py` hooks correctly.
 
 ## Improvements
 1. The current automation tool only works with the exact PowerBI site that defined in the config since it detects the scrollable containers by label
